@@ -4,8 +4,9 @@ From-scratch GPT-style language model training on an AMD RX 6600 (gfx1032, 8 GB)
 running PyTorch CUDA 11.8 wheels through [ZLUDA](https://github.com/lshqqytiger/ZLUDA).
 
 This is an experimental, pinned setup that requires community gfx1032 rocBLAS kernels.
-The original environment reported working GPU training; run the numerical probes on your
-installation before training. The portable support changes require RX 6600 hardware validation.
+GPU operations, production training, sampling and checkpoints have been verified on an
+RX 6600; see the [tested environment and limits](SETUP.md#hardware-validation).
+Run the numerical probes on your installation before training.
 
 ## Contents
 
@@ -27,7 +28,7 @@ installation before training. The portable support changes require RX 6600 hardw
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\zluda_run_probe.ps1
 powershell -ExecutionPolicy Bypass -File scripts\zluda_run_train_smoke.ps1
-powershell -ExecutionPolicy Bypass -File scripts\zluda_run_train.ps1 --steps 10 --batch-size 4 --eval-iters 2
+powershell -ExecutionPolicy Bypass -File scripts\zluda_run_train.ps1 --steps 10 --batch-size 4 --eval-iters 2 --warmup-steps 2
 ```
 
 Live progress goes to the console and `train_log.txt`.

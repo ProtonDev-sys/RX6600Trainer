@@ -93,7 +93,7 @@ Both the Python scripts and launchers return nonzero on failure.
 Place `TinyStories.txt` in the repository, then start with a small workload:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\zluda_run_train.ps1 --steps 10 --batch-size 4 --eval-iters 2
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\zluda_run_train.ps1 --steps 10 --batch-size 4 --eval-iters 2 --warmup-steps 2
 ```
 
 GPU training is the default and does not fall back silently to CPU. Startup
@@ -129,3 +129,45 @@ failure handling, CPU training through checkpoint creation, and native launcher
 arguments, paths and exit codes. **They do not validate RX 6600 hardware.** Run
 both GPU probes on the target card and record GPU, driver and stack versions
 before treating a revision as hardware validated.
+
+## Hardware validation
+
+The following configuration was tested on 2026-09-07 UTC using training source
+`dcdf7a3`. Tests ran in a separate checkout with a synthetic 44,000-character
+corpus; the existing project's corpus, cache and checkpoints were preserved.
+
+| Component | Observed configuration |
+| --- | --- |
+| GPU | AMD Radeon RX 6600, 8 GiB |
+| OS / display driver | Windows 10 Pro, build 19045 / `32.0.21043.19003` |
+| Python / PyTorch | 3.12.10 / `2.4.1+cu118` |
+| NumPy | 2.5.2 in the existing GPU environment; installation and CPU CI retain 1.26.4 |
+| ZLUDA | Stable v3.9.5 ROCm6; executable and cuBLAS hashes matched the release archive |
+| Loaded HIP runtime | `C:\Windows\System32\amdhip64_6.dll`; `hipRuntimeGetVersion` returned status 0 and raw version `60450101` (fields 6, 4, 50101) |
+| Loaded rocBLAS / rocSOLVER | From `C:\Program Files\AMD\ROCm\6.2\bin`, with the gfx1032 rocBLAS kernels |
+
+The GPU probe checked matmul and backward against CPU references. The training
+smoke checked batched matmul, biased linear output/gradients, math attention and
+five production GPT/AdamW updates; loss went from 4.8749 to 4.5275. Direct cuBLAS
+GEMM also matched the CPU reference. Each launcher returned 0.
+The Windows wheel warned that flash attention was unavailable; the explicitly
+selected math attention backend passed its check.
+
+Two production runs completed training, evaluation, two 120-token samples and
+checkpoint creation: a two-step tiny model, and the ten-step command in step 4
+using the default six-layer, 10.76M-parameter model (six heads, embedding size
+384, block size 256). The latter's loss went from 3.3805 to 2.4459, with validation
+loss 2.5428. Both saved checkpoints loaded onto CPU with finite tensors. These
+short synthetic-corpus runs establish functionality, not model convergence.
+
+The first training smoke took about ten minutes, and the tiny trainer reported
+about seventeen minutes while the ZLUDA kernel cache grew. With a warm cache,
+the ten-step trainer reported 4.3 seconds for training, evaluation, sampling and
+checkpoint creation after initialization. Timings depend on the cache, workload
+and driver; this is not a hardware-throughput benchmark. Keep the cache at
+`%LOCALAPPDATA%\ZLUDA\ComputeCache` between runs.
+
+This PC's inherited `HIP_PATH` selected an older 5.7 SDK. Validation explicitly
+set `HIP_PATH` to the 6.2 directory as shown in step 3. Windows still loaded its
+driver-provided HIP runtime from System32, so the SDK folder name alone does not
+identify the runtime version. Other driver/runtime combinations remain unvalidated.
