@@ -1,113 +1,98 @@
-import os
-os.environ["DISABLE_ADDMM_CUDA_LT"] = "1"
+"""Exercise the training operations and the production GPT on the GPU."""
 
-import torch
-import torch.nn as nn
+from copy import deepcopy
+import sys
+import traceback
 
-torch.backends.cudnn.enabled = False
-torch.backends.cuda.enable_flash_sdp(False)
-torch.backends.cuda.enable_math_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
-torch.backends.cuda.enable_cudnn_sdp(False)
+from rx6600_runtime import require_gpu, synchronize, torch, verify_gpu
 
-out = []
+from train_tinystories import GPT
 
-def check(name, fn):
-    try:
-        v = fn()
-        out.append("PASS: " + name + ((" -> " + str(v)) if v is not None else ""))
-    except Exception as e:
-        import traceback
-        out.append("FAIL: " + name + ": " + repr(e))
-        out.append(traceback.format_exc())
 
-dtype = torch.float32
-dev = "cuda"
+def check_finite(value, name):
+    if not torch.isfinite(value).all().item():
+        raise RuntimeError(f"{name} contains non-finite values")
 
-def bmm_test():
-    a = torch.randn(32, 64, 128, device=dev, dtype=dtype)
-    b = torch.randn(32, 128, 96, device=dev, dtype=dtype)
-    c = torch.bmm(a, b)
-    torch.cuda.synchronize()
-    return round(c.sum().item(), 4)
 
-def linear_test():
-    m = nn.Linear(256, 512).to(dev)
-    x = torch.randn(16, 128, 256, device=dev, dtype=dtype)
-    y = m(x)
-    torch.cuda.synchronize()
-    return str(y.shape)
+def check_ops(device):
+    a_cpu = torch.arange(4 * 16 * 32, dtype=torch.float32).reshape(4, 16, 32) / 1024 - 1
+    b_cpu = torch.arange(4 * 32 * 24, dtype=torch.float32).reshape(4, 32, 24) / 1536 - 1
+    actual = torch.bmm(a_cpu.to(device), b_cpu.to(device))
+    torch.testing.assert_close(actual.cpu(), torch.bmm(a_cpu, b_cpu), rtol=1e-4, atol=1e-5)
+    print("PASS: bmm agrees with CPU", flush=True)
 
-def layernorm_test():
-    ln = nn.LayerNorm(256).to(dev)
-    x = torch.randn(16, 128, 256, device=dev, dtype=dtype)
-    y = ln(x)
-    torch.cuda.synchronize()
-    return round(y.mean().item(), 4)
+    # Bias exercises addmm, whose default cuBLASLt path is unavailable here.
+    cpu_linear = torch.nn.Linear(32, 24)
+    with torch.no_grad():
+        cpu_linear.weight.copy_(torch.arange(24 * 32).reshape(24, 32) / 768 - 0.5)
+        cpu_linear.bias.copy_(torch.arange(24) / 24 - 0.5)
+    linear = deepcopy(cpu_linear).to(device)
+    cpu_input = (torch.arange(2 * 8 * 32, dtype=torch.float32).reshape(2, 8, 32) / 256 - 1).requires_grad_()
+    gpu_input = cpu_input.detach().to(device).clone().requires_grad_()
+    expected = cpu_linear(cpu_input)
+    actual = linear(gpu_input)
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    for result, reference in (
+        (actual, expected),
+        (gpu_input.grad, cpu_input.grad),
+        (linear.weight.grad, cpu_linear.weight.grad),
+        (linear.bias.grad, cpu_linear.bias.grad),
+    ):
+        torch.testing.assert_close(result.cpu(), reference, rtol=1e-4, atol=1e-5)
+    print("PASS: biased linear output and gradients agree with CPU", flush=True)
 
-def embed_test():
-    emb = nn.Embedding(1000, 128).to(dev)
-    idx = torch.randint(0, 1000, (16, 64), device=dev)
-    y = emb(idx)
-    torch.cuda.synchronize()
-    return str(y.shape)
+    q, k, v = [
+        torch.randn(2, 2, 16, 16, device=device, dtype=torch.float32)
+        for _ in range(3)
+    ]
+    attention = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    check_finite(attention, "math scaled dot product attention")
+    print("PASS: math scaled dot product attention", flush=True)
 
-def attn_test():
-    q = torch.randn(4, 8, 64, 64, device=dev, dtype=dtype)
-    k = torch.randn(4, 8, 64, 64, device=dev, dtype=dtype)
-    v = torch.randn(4, 8, 64, 64, device=dev, dtype=dtype)
-    att = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-    torch.cuda.synchronize()
-    return str(att.shape)
 
-def softmax_ce_test():
-    logits = torch.randn(16, 1000, device=dev, dtype=dtype)
-    targets = torch.randint(0, 1000, (16,), device=dev)
-    loss = torch.nn.functional.cross_entropy(logits, targets)
-    torch.cuda.synchronize()
-    return round(loss.item(), 4)
-
-def train_step_test():
-    class TinyTransformer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.emb = nn.Embedding(1000, 64)
-            self.attn = nn.MultiheadAttention(64, 4, batch_first=True, dropout=0.0)
-            self.ln1 = nn.LayerNorm(64)
-            self.ff = nn.Sequential(nn.Linear(64, 256), nn.ReLU(), nn.Linear(256, 64))
-            self.ln2 = nn.LayerNorm(64)
-            self.out = nn.Linear(64, 1000)
-        def forward(self, x):
-            x = self.emb(x)
-            a, _ = self.attn(x, x, x)
-            x = self.ln1(x + a)
-            x = self.ln2(x + self.ff(x))
-            return self.out(x)
-
+def check_train_steps(device):
+    # Use the real trainer so this checks its embedding, linear layers, layernorm,
+    # causal attention, cross entropy and backward path together.
     torch.manual_seed(0)
-    model = TinyTransformer().to(dev)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model = GPT(128, n_layer=1, n_head=2, n_embd=32, block_size=16, dropout=0.0).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, foreach=False, fused=False)
+    indices = torch.randint(0, 128, (2, 16), device=device)
+    targets = torch.randint(0, 128, (2, 16), device=device)
+    initial_weight = model.token_embedding.weight.detach().clone()
     losses = []
-    for i in range(5):
-        idx = torch.randint(0, 1000, (8, 32), device=dev)
-        target = torch.randint(0, 1000, (8, 32), device=dev)
-        logits = model(idx)
-        loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
-        opt.zero_grad(set_to_none=True)
+    for _ in range(5):
+        optimizer.zero_grad(set_to_none=True)
+        logits, loss = model(indices, targets)
+        check_finite(logits, "GPT logits")
+        check_finite(loss, "GPT loss")
         loss.backward()
-        opt.step()
-        torch.cuda.synchronize()
+        for name, parameter in model.named_parameters():
+            if parameter.grad is None:
+                raise RuntimeError(f"{name} did not receive a gradient")
+            check_finite(parameter.grad, f"{name} gradient")
+        optimizer.step()
+        for name, parameter in model.named_parameters():
+            check_finite(parameter, f"{name} after AdamW")
         losses.append(round(loss.item(), 4))
-    return str(losses)
+    synchronize(device)
+    if torch.equal(initial_weight, model.token_embedding.weight):
+        raise RuntimeError("AdamW did not update the model weights")
+    print(f"PASS: 5 production GPT train steps (fp32, AdamW): {losses}", flush=True)
 
-check("bmm", bmm_test)
-check("linear", linear_test)
-check("layernorm", layernorm_test)
-check("embedding", embed_test)
-check("attention", attn_test)
-check("softmax+cross_entropy", softmax_ce_test)
-check("5 train steps (mini transformer, AdamW)", train_step_test)
 
-with open(r"C:\Users\HTD\AppData\Local\Temp\opencode\train_smoke_result.txt", "w") as f:
-    f.write("\n".join(out))
-print("\n".join(out))
+def main():
+    try:
+        device = require_gpu()
+        verify_gpu()
+        check_ops(device)
+        check_train_steps(device)
+        print("ALL TRAINING TESTS PASSED", flush=True)
+        return 0
+    except Exception:
+        traceback.print_exc(file=sys.stdout)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

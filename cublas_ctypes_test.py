@@ -1,25 +1,14 @@
-import os
-os.environ["DISABLE_ADDMM_CUDA_LT"] = "1"
+"""Compare torch and direct ZLUDA cuBLAS GEMM against a CPU reference."""
 
-LOG = r"C:\Users\HTD\AppData\Local\Temp\opencode\cublas_ctypes_log.txt"
-
-def log(msg):
-    with open(LOG, "a") as f:
-        f.write(msg + "\n")
-        f.flush()
-    print(msg, flush=True)
-
-import sys
 import ctypes
+from contextlib import ExitStack
+import os
+from pathlib import Path
+import sys
 import traceback
 
-log("=== cublas ctypes test start ===")
+from rx6600_runtime import require_gpu, torch
 
-try:
-    import torch
-except Exception as e:
-    log("torch import failed: " + repr(e))
-    sys.exit(1)
 
 STATUS = {
     0: "SUCCESS",
@@ -34,125 +23,73 @@ STATUS = {
     16: "LICENSE_ERROR",
 }
 
-try:
-    log("cuda available: " + str(torch.cuda.is_available()))
-    a = torch.randn(2048, 2048, device="cuda", dtype=torch.float32)
-    b = torch.randn(2048, 2048, device="cuda", dtype=torch.float32)
-    c = torch.zeros(2048, 2048, device="cuda", dtype=torch.float32)
-    log("torch cuda alloc ok, a_ptr=%#x b_ptr=%#x c_ptr=%#x" % (a.data_ptr(), b.data_ptr(), c.data_ptr()))
-except Exception as e:
-    log("ALLOC FAILED: " + repr(e)); log(traceback.format_exc()); sys.exit(1)
 
-log("PATH in child: " + os.environ.get("PATH", "<none>"))
+def check_status(name, status):
+    if status != 0:
+        raise RuntimeError(f"{name}: {STATUS.get(status, 'UNKNOWN')} ({status})")
 
-def tryload(path, mode=0):
+
+def check_cublas(device):
+    zluda_dir = Path(os.environ.get("ZLUDA_PATH", str(Path.home() / "zluda")))
+    hip_dir = Path(os.environ.get("HIP_PATH", r"C:\Program Files\AMD\ROCm\6.2"))
+    with ExitStack() as stack:
+        for directory in (hip_dir / "bin", zluda_dir):
+            stack.enter_context(os.add_dll_directory(str(directory.resolve())))
+        cublas = ctypes.WinDLL(str((zluda_dir / "cublas.dll").resolve()))
+        handle_type = ctypes.c_void_p
+        cublas.cublasCreate_v2.argtypes = [ctypes.POINTER(handle_type)]
+        cublas.cublasCreate_v2.restype = ctypes.c_int
+        cublas.cublasDestroy_v2.argtypes = [handle_type]
+        cublas.cublasDestroy_v2.restype = ctypes.c_int
+        cublas.cublasSetStream_v2.argtypes = [handle_type, ctypes.c_void_p]
+        cublas.cublasSetStream_v2.restype = ctypes.c_int
+        cublas.cublasSgemm_v2.argtypes = [
+            handle_type, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_int,
+        ]
+        cublas.cublasSgemm_v2.restype = ctypes.c_int
+
+        a_cpu = torch.arange(8 * 16, dtype=torch.float32).reshape(8, 16) / 128
+        b_cpu = torch.arange(16 * 12, dtype=torch.float32).reshape(16, 12) / 192
+        expected = a_cpu @ b_cpu
+        a, b = a_cpu.to(device), b_cpu.to(device)
+        c = torch.empty((8, 12), device=device, dtype=torch.float32)
+        torch.testing.assert_close((a @ b).cpu(), expected, rtol=1e-4, atol=1e-5)
+        print("PASS: torch GEMM agrees with CPU", flush=True)
+
+        handle = handle_type()
+        check_status("cublasCreate_v2", cublas.cublasCreate_v2(ctypes.byref(handle)))
+        try:
+            stream = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
+            check_status("cublasSetStream_v2", cublas.cublasSetStream_v2(handle, stream))
+            alpha, beta = ctypes.c_float(1.0), ctypes.c_float(0.0)
+            # cuBLAS is column-major: for row-major tensors compute C^T = B^T A^T.
+            status = cublas.cublasSgemm_v2(
+                handle, 0, 0, 12, 8, 16,
+                ctypes.byref(alpha), ctypes.c_void_p(b.data_ptr()), 12,
+                ctypes.c_void_p(a.data_ptr()), 16,
+                ctypes.byref(beta), ctypes.c_void_p(c.data_ptr()), 12,
+            )
+            check_status("cublasSgemm_v2", status)
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(c.cpu(), expected, rtol=1e-4, atol=1e-5)
+            print("PASS: direct ZLUDA cuBLAS GEMM agrees with CPU", flush=True)
+        finally:
+            check_status("cublasDestroy_v2", cublas.cublasDestroy_v2(handle))
+
+
+def main():
     try:
-        d = ctypes.WinDLL(path, mode=mode)
-        log("LOADED: " + path + ("" if mode == 0 else " (mode=0x8)"))
-        return d
-    except Exception as e:
-        log("FAILED %s: %s" % (path, repr(e)))
-        return None
+        device = require_gpu()
+        check_cublas(device)
+        return 0
+    except Exception:
+        traceback.print_exc(file=sys.stdout)
+        return 1
 
-for dep in [r"C:\Program Files\AMD\ROCm\6.2\bin\amdhip64_6.dll",
-            r"C:\Program Files\AMD\ROCm\6.2\bin\rocblas.dll",
-            r"C:\Program Files\AMD\ROCm\6.2\bin\rocsolver.dll"]:
-    if tryload(dep) is None:
-        if tryload(dep, 0x00000008) is None:
-            log("cannot load dep: " + dep)
-            sys.exit(1)
 
-cublas = None
-for mode in [0, 0x00000008]:
-    cublas = tryload(r"C:\Users\HTD\zluda\cublas.dll", mode)
-    if cublas is not None:
-        break
-if cublas is None:
-    sys.exit(1)
-
-for name in ["cublasCreate_v2", "cublasSgemm_v2", "cublasSetStream_v2", "cublasGetVersion_v2", "cublasSgemmStridedBatched_v2", "cublasGetStream_v2", "cublasSetPointerMode_v2"]:
-    try:
-        getattr(cublas, name)
-        log("symbol %s exported" % name)
-    except AttributeError:
-        log("symbol %s MISSING" % name)
-
-cublas.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
-cublas.cublasCreate_v2.restype = ctypes.c_int
-cublas.cublasSetStream_v2.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-cublas.cublasSetStream_v2.restype = ctypes.c_int
-cublas.cublasGetStream_v2.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-cublas.cublasGetStream_v2.restype = ctypes.c_int
-cublas.cublasGetVersion_v2.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-cublas.cublasGetVersion_v2.restype = ctypes.c_int
-cublas.cublasSgemm_v2.argtypes = [
-    ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-    ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int,
-    ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_int,
-]
-cublas.cublasSgemm_v2.restype = ctypes.c_int
-
-try:
-    log("torch a@b (torch internal cublas) BEFORE manual handle...")
-    c2 = a @ b
-    torch.cuda.synchronize()
-    log("torch a@b OK, sum: " + str(c2.sum().item()))
-except Exception as e:
-    log("TORCH a@b FAILED: " + repr(e)); log(traceback.format_exc())
-
-handle = ctypes.c_void_p()
-st = cublas.cublasCreate_v2(ctypes.byref(handle))
-log("cublasCreate_v2 = %d (%s), handle=%d" % (st, STATUS.get(st, "?"), handle.value or 0))
-if st != 0:
-    sys.exit(1)
-
-ver = ctypes.c_int(0)
-st = cublas.cublasGetVersion_v2(handle, ctypes.byref(ver))
-log("cublasGetVersion_v2 = %d (%s), version=%d" % (st, STATUS.get(st, "?"), ver.value))
-
-try:
-    cur_stream = torch.cuda.current_stream(0).cuda_stream
-    log("torch current stream id: %d" % cur_stream)
-except Exception as e:
-    cur_stream = 0
-    log("current_stream query failed: " + repr(e))
-
-st = cublas.cublasSetStream_v2(handle, ctypes.c_void_p(cur_stream))
-log("cublasSetStream_v2 = %d (%s)" % (st, STATUS.get(st, "?")))
-
-got_stream = ctypes.c_void_p()
-st = cublas.cublasGetStream_v2(handle, ctypes.byref(got_stream))
-log("cublasGetStream_v2 = %d (%s), stream=%d" % (st, STATUS.get(st, "?"), got_stream.value or 0))
-
-alpha = ctypes.c_float(1.0)
-beta = ctypes.c_float(0.0)
-m = n = k = 2048
-
-try:
-    log("calling cublasSgemm_v2 directly (2048x2048x2048, with set stream)...")
-    st = cublas.cublasSgemm_v2(
-        handle, 0, 0, m, n, k,
-        ctypes.byref(alpha), ctypes.c_void_p(a.data_ptr()), 2048,
-        ctypes.c_void_p(b.data_ptr()), 2048,
-        ctypes.byref(beta), ctypes.c_void_p(c.data_ptr()), 2048,
-    )
-    log("cublasSgemm_v2 = %d (%s)" % (st, STATUS.get(st, "?")))
-    torch.cuda.synchronize()
-    log("c sum (should be ~0 if gemm ran): " + str(c.sum().item()))
-except Exception as e:
-    log("SGEM DIRECT RAISED: " + repr(e)); log(traceback.format_exc())
-
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
-kernel32.GetModuleHandleW.restype = ctypes.c_void_p
-kernel32.GetProcAddress.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-kernel32.GetProcAddress.restype = ctypes.c_void_p
-
-zluda_cublas_h = cublas._handle
-log("ctypes ZLUDA cublas.dll module base: %d" % zluda_cublas_h)
-for name in ["cublas.dll", "cublas64_11.dll", "cublasLt64_11.dll", "cublasLt.dll", "cudart64_11.dll", "rocblas.dll"]:
-    h = kernel32.GetModuleHandleW(name)
-    pa = kernel32.GetProcAddress(h, b"cublasSgemm_v2") if h else None
-    log("module %-20s handle=%d  sgemm_v2 addr=%s" % (name, h or 0, hex(pa) if pa else "n/a"))
-
-log("=== cublas ctypes test done ===")
+if __name__ == "__main__":
+    sys.exit(main())
