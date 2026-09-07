@@ -1,19 +1,15 @@
-import os
-import sys
 import json
 import math
 import time
 import argparse
 import pathlib
 
-os.environ["DISABLE_ADDMM_CUDA_LT"] = "1"
+from rx6600_runtime import configure_torch, require_gpu, synchronize, verify_gpu
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-torch.backends.cudnn.enabled = False
 
 DATA_FILE = "TinyStories.txt"
 SENTINEL = "\x00"
@@ -183,6 +179,7 @@ def estimate_loss(model, train_data, val_data, batch_size, block_size, eval_iter
         f.write("EVAL " + text + "\n")
 
 
+@torch.no_grad()
 def sample_text(model, seed, itos, n_tokens, device, block_size):
     model.eval()
     idx = torch.tensor([[seed]], dtype=torch.long).to(device)
@@ -197,6 +194,8 @@ def sample_text(model, seed, itos, n_tokens, device, block_size):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--device", choices=("cuda", "cpu"), default="cuda",
+                    help="cuda requires the RX 6600/ZLUDA setup; cpu is for development")
     ap.add_argument("--n-layer", type=int, default=6)
     ap.add_argument("--n-head", type=int, default=6)
     ap.add_argument("--n-embd", type=int, default=384)
@@ -211,7 +210,11 @@ def main():
     ap.add_argument("--seed", type=int, default=1337)
     args = ap.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = require_gpu() if args.device == "cuda" else torch.device("cpu")
+    if device.type == "cuda":
+        verify_gpu()
+    else:
+        configure_torch()
     torch.manual_seed(args.seed)
     train_data, val_data, vocab_size, itos = load_data()
     print(f"device {device}, train {len(train_data)} chars, val {len(val_data)} chars", flush=True)
@@ -220,18 +223,9 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model params: {n_params/1e6:.2f}M", flush=True)
 
-    if device == "cuda":
-        gpu_diag = torch.randn(4096, 4096, device="cuda")
-        t_b = time.time()
-        gpu_diag = gpu_diag @ gpu_diag
-        torch.cuda.synchronize()
-        gpu_ms = (time.time() - t_b) * 1000
-        gflops = 2 * 4096**3 / 1e9
-        print(f"synthetic 4096^3 fp32 GEMM on GPU: {gpu_ms:.0f} ms = {gflops / (gpu_ms/1000) / 1000:.2f} TFLOPS", flush=True)
-        del gpu_diag
-        torch.cuda.empty_cache()
-
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.1)
+    # Avoid fused CUDA kernels and foreach's extra peak memory on an 8 GiB card.
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
+                            weight_decay=0.1, foreach=False, fused=False)
     def lr_at(step):
         if step < args.warmup_steps:
             return args.lr * (step + 1) / args.warmup_steps
@@ -252,30 +246,30 @@ def main():
         bx, by = bx.to(device), by.to(device)
         t_fwd = time.time()
         _, loss = model(bx, by)
-        torch.cuda.synchronize()
+        synchronize(device)
         t_fwd = time.time() - t_fwd
         opt.zero_grad(set_to_none=True)
         t_bwd = time.time()
         loss.backward()
-        torch.cuda.synchronize()
+        synchronize(device)
         t_bwd = time.time() - t_bwd
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         t_opt = time.time()
         opt.step()
-        torch.cuda.synchronize()
+        synchronize(device)
         t_opt = time.time() - t_opt
         scheduler.step()
 
         tokens_so_far += args.batch_size * args.block_size
         if step % eval_log_interval == 0 or step == args.steps:
-            mem = torch.cuda.memory_allocated() / 1e9 if device == "cuda" else 0.0
+            mem = torch.cuda.memory_allocated() / 1e9 if device.type == "cuda" else 0.0
             line = f"step {step}/{args.steps} loss {loss.item():.4f} lr {lr_at(step):.2e} fwd {t_fwd*1000:.0f}ms bwd {t_bwd*1000:.0f}ms opt {t_opt*1000:.0f}ms mem {mem:.2f}GB"
             print(line, flush=True)
             with open(log_file, "a", buffering=1) as f:
                 f.write(line + "\n")
 
     estimate_loss(model, train_data, val_data, args.batch_size, args.block_size, args.eval_iters, itos, device, {"step": args.steps, "log": log_file})
-    for seed in (itos.get(SENTINEL, 0), 65):
+    for seed in dict.fromkeys((0, min(65, vocab_size - 1))):
         text = sample_text(model, seed, itos, 120, device, args.block_size)
         text = text.replace(SENTINEL_HTML, "\n<|endoftext|>\n")
         print("--- sample ---\n" + text + "\n-------------", flush=True)
