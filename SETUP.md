@@ -1,83 +1,131 @@
-# Setup: PyTorch CUDA wheels on AMD RX 6600 via ZLUDA (native Windows)
+# RX 6600 setup on native Windows
 
-This documents the working setup. **The critical fix is #4** (the cuBLAS DLL swap) — without it,
-`torch.cuda.is_available()` returns True but *every* matmul fails with
-`CUBLAS_STATUS_NOT_SUPPORTED`.
+This project uses an experimental, pinned ZLUDA stack for the RX 6600 (gfx1032,
+8 GiB). AMD's [HIP SDK 6.2.4 support table](https://rocm.docs.amd.com/projects/install-on-windows/en/docs-6.2.4/reference/system-requirements.html)
+supports this GPU's HIP runtime, but **not its SDK libraries**. The community
+gfx1032 rocBLAS package below is therefore required. This is not official AMD
+PyTorch support.
 
-## 1. Install ZLUDA (rocm6 build)
+## 1. Install the matching native components
 
-Download and extract to `C:\Users\HTD\zluda`:
+- Install AMD's Windows HIP SDK **6.2.4**. Its usual root is
+  `C:\Program Files\AMD\ROCm\6.2`.
+- Extract the **ROCm6** archive from [ZLUDA v3.9.5](https://github.com/lshqqytiger/ZLUDA/releases/tag/rel.5e717459179dc272b7d7d23391f0fad66c7459cf)
+  (`ZLUDA-windows-rocm6-amd64.zip`) to `$env:USERPROFILE\zluda`, with `zluda.exe`
+  directly in that directory. This release adds support for Adrenalin 25.5.1;
+  compatibility with every newer driver is not established.
+- Download `rocm.gfx1032.for.hip.sdk.6.2.4.navi21.logic.7z` from the
+  [community rocBLAS v0.6.2.4 release](https://github.com/likelovewant/ROCmLibs-for-gfx1103-AMD780M-APU/releases/tag/v0.6.2.4).
+  Back up the SDK's `bin\rocblas.dll` and `bin\rocblas\library` directory, then
+  replace them with the package's matching DLL and library directory. Keep the
+  matching SDK's `amdhip64_6.dll` and `rocsolver.dll` in `bin`.
 
-```
-https://github.com/lshqqytiger/ZLUDA/releases/download/rel.5e717459179dc272b7d7d23391f0fad66c7459cf/ZLUDA-windows-rocm6-amd64.zip
-```
+The launchers check for the required files, Tensile metadata, and gfx1032 kernel
+artifacts. File presence does not prove driver or binary compatibility; run the
+numerical probes in step 4.
 
-The folder contains `zluda.exe`, `cublas.dll`, `nvcuda.dll`, `zluda_redirect.dll`, etc.
+## 2. Create the Python environment
 
-## 2. Install ROCm 6.2 with patched gfx1032 rocBLAS
-
-Install the ROCm 6.2 Windows SDK from AMD. Then replace the stock `rocblas.dll` and the
-`rocblas\library` folder under `C:\Program Files\AMD\ROCm\6.2\bin` with the gfx1032 build that
-contains kernels for the RX 6600:
-
-```
-https://github.com/likelovewant/ROCmLibs-for-gfx1103-AMD780M-APU/releases/download/v0.6.2.4/rocm.gfx1032.for.hip.sdk.6.2.4.navi21.logic.7z
-```
-
-(Back up the stock files before replacing.)
-
-## 3. Install Python + PyTorch CUDA 11.8 wheels
+From this repository, using **Python 3.12 x64**:
 
 ```powershell
 py -3.12 -m venv .venv
-.venv\Scripts\pip install torch==2.4.1+cu118 torchvision==0.19.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+.venv\Scripts\python.exe -m pip install -r requirements-rx6600.txt
 ```
 
-## 4. THE cuBLAS FIX (resolves CUBLAS_STATUS_NOT_SUPPORTED)
+The requirements select **torch 2.4.1+cu118** and **NumPy 1.26.4** as a reproducible
+baseline. torchvision is not needed by this trainer. Use the CUDA 11.8 wheel;
+CPU, ROCm and newer CUDA wheels are not interchangeable with this setup. See
+[PyTorch's 2.4.1 wheel instructions](https://pytorch.org/get-started/previous-versions/#v241)
+and the [pinned ZLUDA PyTorch instructions](https://github.com/lshqqytiger/ZLUDA/blob/5e717459179dc272b7d7d23391f0fad66c7459cf/README.md#pytorch).
 
-PyTorch's cu118 wheel statically imports cuBLAS from `cublas64_11.dll`. That file, shipped inside
-`torch\lib`, is NVIDIA's real cuBLAS. It loads against ZLUDA's fake driver but returns
-`CUBLAS_STATUS_NOT_SUPPORTED` from every GEMM.
+## 3. Configure paths and apply the cuBLAS fix
 
-Fix: replace torch's `cublas64_11.dll` with ZLUDA's working implementation
-(a copy of `C:\Users\HTD\zluda\cublas.dll`). Back up the original first:
+These optional environment variables override the defaults for the current shell:
 
 ```powershell
-$lib = ".venv\Lib\site-packages\torch\lib"
-Copy-Item "$lib\cublas64_11.dll" "$lib\cublas64_11.dll.nv_backup"
-Copy-Item "C:\Users\HTD\zluda\cublas.dll" "$lib\cublas64_11.dll" -Force
+$env:ZLUDA_PATH = 'D:\GPU tools\zluda'          # directory containing zluda.exe
+$env:HIP_PATH = 'C:\Program Files\AMD\ROCm\6.2' # SDK root, not bin
+$env:RX6600_PYTHON = 'D:\Python envs\trainer\Scripts\python.exe'
 ```
 
-ZLUDA's `cublas.dll` exports every symbol torch imports (including `cublasSgemmStridedBatched`,
-`GemmEx`, `*_v2`, batched/async variants), and it depends only on `rocblas.dll` + `rocsolver.dll`,
-which resolve via the PATH entries in the launcher.
+Without overrides, launchers use `$env:USERPROFILE\zluda`, the HIP path above,
+and this repository's `.venv\Scripts\python.exe`. Relative overrides resolve
+from the calling directory. Launchers run the script from the repository, so
+the corpus, cache, training log and checkpoints live there.
 
-### Verify
+PyTorch's CUDA 11.8 wheel ships NVIDIA's `torch\lib\cublas64_11.dll`. In the
+original RX 6600 setup, device discovery succeeded but GEMM returned
+`CUBLAS_STATUS_NOT_SUPPORTED` until that DLL was replaced with ZLUDA's `cublas.dll`.
+Apply the same fix using the Python environment you will train with:
+
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\zluda_run_probe.ps1
+.venv\Scripts\python.exe setup_rx6600.py --apply
+.venv\Scripts\python.exe setup_rx6600.py
 ```
-Expect: `matmul ok`, `elementwise ok`, `autograd ok`, `ALL GPU TESTS PASSED`.
 
-## 5. Run everything through zluda.exe
+For an external environment, use `& $env:RX6600_PYTHON setup_rx6600.py --apply`.
+The helper checks the torch distribution without importing it, backs up the
+original as `cublas64_11.dll.nv_backup`, and verifies the copy by SHA-256. Repeating
+it preserves the backup. Without `--apply` it only checks and returns nonzero
+when the replacement is missing. It refuses to overwrite a conflicting backup
+after a reinstall; preserve and resolve that backup manually first.
 
-ZLUDA's CUDA driver is `nvcuda.dll` in the ZLUDA folder. Launchers in `scripts/` do three things:
+Close Python processes before changing DLLs. To undo the replacement, copy the
+preserved `.nv_backup` over `cublas64_11.dll` in the same environment. Re-check
+the replacement after reinstalling torch. This fix covers the dense operations
+used by this trainer; it is not a claim of general PyTorch compatibility.
 
-1. Prepend `C:\Program Files\AMD\ROCm\6.2\bin` and `C:\Users\HTD\zluda` to `PATH`.
-2. Set `DISABLE_ADDMM_CUDA_LT=1` (keeps matmul on the legacy cuBLAS path; cuBLASLt is not
-   available on this stack).
-3. Start `zluda.exe -- python <script>` and stream output live.
+## 4. Verify GPU computation, then train
 
-Example:
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\zluda_run_train.ps1 --steps 100 --batch-size 32
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\zluda_run_probe.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\zluda_run_train_smoke.ps1
 ```
 
-## Known limitations
+The first run may take time while ZLUDA compiles kernels. The probe reports the
+device and checks fp32 matmul and gradients against CPU references. The training
+smoke checks batched matmul, biased linear outputs and gradients, math attention,
+and five production GPT/AdamW steps with finite values and updated parameters.
+Expect `ALL GPU TESTS PASSED` and `ALL TRAINING TESTS PASSED`, respectively.
+Both the Python scripts and launchers return nonzero on failure.
 
-- fp32 eager mode only. Half-precision GEMM and cuBLASLt paths are unvalidated; keep
-  `DISABLE_ADDMM_CUDA_LT=1` and `TORCH_BLAS_PREFER_CUBLASLT` unset.
-- cuDNN is disabled (`torch.backends.cudnn.enabled = False`); SDP uses the math backend
-  (flash/mem-efficient are disabled in code).
-- GEMM throughput is currently far below hardware peak (~0.5 TFLOPS measured on 4096^3 fp32).
-  Kernel tuning for gfx1032 is an open item.
-- If you later reinstall/upgrade torch, you must re-apply the DLL swap from step 4.
+Place `TinyStories.txt` in the repository, then start with a small workload:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\zluda_run_train.ps1 --steps 10 --batch-size 4 --eval-iters 2
+```
+
+GPU training is the default and does not fall back silently to CPU. Startup
+verifies numerical GPU work before reading the corpus. If it fails, inspect the
+reported missing file, wheel version, or numerical error and revisit steps 1-3.
+For a direct cuBLAS diagnostic, run `scripts\zluda_run_cublas_ctypes.ps1`.
+
+## Limits and development checks
+
+- Use fp32 eager execution. cuDNN, fused attention backends, TF32, fused AdamW
+  and foreach AdamW are disabled. Both BLASLt preference variables are cleared
+  before importing torch, and `DISABLE_ADDMM_CUDA_LT=1` selects legacy cuBLAS.
+- Half precision, compilation, other GPU architectures and stack upgrades are
+  unvalidated. Reduce batch/block/model sizes if you run out of 8 GiB VRAM.
+  Sampling disables autograd to avoid retaining its generation graph.
+- Throughput depends on the community rocBLAS kernels. The original setup
+  reported about 0.5 TFLOPS for a 4096-cubed fp32 GEMM; no new performance claim
+  is made by the portable support changes.
+- `rocblas_direct_test*.py` are historical experiments, not supported verification
+  entry points. Use the launchers above.
+
+For CPU development, explicitly run `python train_tinystories.py --device cpu`.
+The tests use Python 3.12, torch 2.4.1+cpu and NumPy 1.26.4:
+
+```powershell
+python -m unittest discover -s tests -p 'test_*.py' -v
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\test_launchers.ps1
+pwsh -NoProfile -File tests\test_launchers.ps1
+```
+
+CI runs these tests on Windows. They cover setup backup behavior, backend and
+failure handling, CPU training through checkpoint creation, and native launcher
+arguments, paths and exit codes. **They do not validate RX 6600 hardware.** Run
+both GPU probes on the target card and record GPU, driver and stack versions
+before treating a revision as hardware validated.
