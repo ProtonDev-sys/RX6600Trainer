@@ -202,3 +202,6 @@ finally {
         Remove-Item -LiteralPath $resolvedTempRoot -Recurse -Force
     }
 }
+
+# CI shells propagate LASTEXITCODE; expected failure cases above must not leak it.
+exit 0

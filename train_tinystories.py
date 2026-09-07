@@ -192,6 +192,19 @@ def sample_text(model, seed, itos, n_tokens, device, block_size):
     return "".join(chars)
 
 
+def lr_multiplier(step, warmup_steps, total_steps):
+    """Scale the base LR for the next update, indexed from zero.
+
+    Warmup reaches 1 on update warmup_steps. If the run extends past warmup,
+    cosine starts at 1 on the following update and reaches 0 after total_steps
+    updates. Runs ending during warmup do not decay; zero warmup starts at 1.
+    """
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", choices=("cuda", "cpu"), default="cuda",
@@ -226,12 +239,8 @@ def main():
     # Avoid fused CUDA kernels and foreach's extra peak memory on an 8 GiB card.
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
                             weight_decay=0.1, foreach=False, fused=False)
-    def lr_at(step):
-        if step < args.warmup_steps:
-            return args.lr * (step + 1) / args.warmup_steps
-        prog = (step - args.warmup_steps) / max(1, args.steps - args.warmup_steps)
-        return args.lr * 0.5 * (1 + math.cos(math.pi * min(1.0, prog)))
-    scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda step: lr_multiplier(step, args.warmup_steps, args.steps))
 
     log_file = "train_log.txt"
     eval_log_interval = max(1, args.log_every)
@@ -255,6 +264,7 @@ def main():
         t_bwd = time.time() - t_bwd
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         t_opt = time.time()
+        step_lr = opt.param_groups[0]["lr"]
         opt.step()
         synchronize(device)
         t_opt = time.time() - t_opt
@@ -263,7 +273,7 @@ def main():
         tokens_so_far += args.batch_size * args.block_size
         if step % eval_log_interval == 0 or step == args.steps:
             mem = torch.cuda.memory_allocated() / 1e9 if device.type == "cuda" else 0.0
-            line = f"step {step}/{args.steps} loss {loss.item():.4f} lr {lr_at(step):.2e} fwd {t_fwd*1000:.0f}ms bwd {t_bwd*1000:.0f}ms opt {t_opt*1000:.0f}ms mem {mem:.2f}GB"
+            line = f"step {step}/{args.steps} loss {loss.item():.4f} lr {step_lr:.2e} fwd {t_fwd*1000:.0f}ms bwd {t_bwd*1000:.0f}ms opt {t_opt*1000:.0f}ms mem {mem:.2f}GB"
             print(line, flush=True)
             with open(log_file, "a", buffering=1) as f:
                 f.write(line + "\n")

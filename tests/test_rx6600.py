@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import rx6600_runtime as runtime
 from setup_rx6600 import configure_cublas
-from train_tinystories import GPT, sample_text
+from train_tinystories import GPT, lr_multiplier, sample_text
 import training_smoke
 
 torch = runtime.torch
@@ -119,6 +119,30 @@ class RuntimeTests(unittest.TestCase):
 
 
 class TrainingTests(unittest.TestCase):
+    def test_scheduler_applies_base_lr_once_and_handles_boundaries(self):
+        # Check real parameter updates, including the warmup/cosine transition.
+        cases = (
+            (2, 6, [0.5, 1.0, 1.0, 0.8535533905932737, 0.5, 0.1464466094067262], 0.0),
+            (0, 2, [1.0, 0.5], 0.0),
+            (2, 2, [0.5, 1.0], 1.0),
+            (4, 2, [0.25, 0.5], 0.75),
+        )
+        for base_lr in (6e-4, 0.0):
+            for warmup, steps, expected_factors, next_factor in cases:
+                with self.subTest(base_lr=base_lr, warmup=warmup, steps=steps):
+                    parameter = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float64))
+                    optimizer = torch.optim.SGD([parameter], lr=base_lr)
+                    scheduler = torch.optim.lr_scheduler.LambdaLR(
+                        optimizer, lambda step: lr_multiplier(step, warmup, steps))
+                    for factor in expected_factors:
+                        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], base_lr * factor)
+                        previous = parameter.item()
+                        parameter.grad = torch.ones_like(parameter)
+                        optimizer.step()
+                        self.assertAlmostEqual(previous - parameter.item(), base_lr * factor)
+                        scheduler.step()
+                    self.assertAlmostEqual(optimizer.param_groups[0]["lr"], base_lr * next_factor)
+
     def test_production_smoke_on_cpu(self):
         runtime.configure_torch()
         with contextlib.redirect_stdout(io.StringIO()):
@@ -152,6 +176,7 @@ class TrainingTests(unittest.TestCase):
             ], cwd=path, env=env, capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("device cpu", result.stdout)
+            self.assertRegex(result.stdout, r"step 1/1 loss \S+ lr 6\.00e-05 ")
             self.assertIn("val loss", result.stdout)
             self.assertIn("checkpoint saved", result.stdout)
             saved = torch.load(path / "train_ckpt" / "ckpt_step1.pt", weights_only=True)
