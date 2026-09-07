@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Training artifacts
+cache/
+train_ckpt/
+train_log.txt
+*.log
+
+# Runtime
+*.bin
+*.npy
+
+# Raw dataset (kept local, not committed)
+TinyStories.txt
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
